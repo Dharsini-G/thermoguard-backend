@@ -1,0 +1,12 @@
+# Sensitive credentials
+.env
+*.env
+
+# Python cache & virtual environments
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Local databases
+*.db
