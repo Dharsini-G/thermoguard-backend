@@ -19,3 +19,6 @@ ThermoGuard is a FastAPI-powered backend designed to compute real-time Human The
    ```bash
    git clone [https://github.com/Dharsini-G/thermoguard-backend.git](https://github.com/Dharsini-G/thermoguard-backend.git)
    cd thermoguard-backend
+<img width="960" height="444" alt="img1" src="https://github.com/user-attachments/assets/516a1b7b-8ac0-4fa9-9f4b-225f7615e5a9" />
+<img width="960" height="448" alt="img2" src="https://github.com/user-attachments/assets/da77d4fb-b137-4470-aa53-534af6864b46" />
+
