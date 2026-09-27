@@ -6,36 +6,45 @@ Exposes ward risk data as REST endpoints for the dashboard to consume.
 Run with:  uvicorn app.main:app --reload
 Then open: http://127.0.0.1:8000/docs  for interactive API docs.
 """
-#from app.services.alerts import check_and_send_alerts
-from fastapi import FastAPI, Depends
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from collections import defaultdict
+import time
+import httpx
+
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from datetime import datetime
-from app.services.mortality_predictor import predict_mortality_risk_multiplier
+
 from app.models.database import get_db, WardDB, RiskReadingDB, init_db
 from app.services.ingestion import load_districts_from_csv, fetch_all_current_batch, fetch_forecast_weather
-import httpx
-from collections import defaultdict
+from app.services.mortality_predictor import predict_mortality_risk_multiplier
 from app.services.vulnerability import calculate_vulnerability_index
 from app.core.thermal_index import compute_thermal_index, WeatherInput
-import time
 
 _cache = {"data": None, "timestamp": 0}
 
-app = FastAPI(title="ThermoGuard API", description="Human Thermal Stress Index & Heat-Risk Early Warning System")
 
-# Allow the React dashboard (running on a different port/domain) to call this API
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Modern startup/shutdown context manager replacing deprecated @app.on_event."""
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="ThermoGuard API",
+    description="Human Thermal Stress Index & Heat-Risk Early Warning System",
+    lifespan=lifespan,
+)
+
+# Allow the React dashboard to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this to your real frontend URL before public deployment
+    allow_origins=["*"],  # Tighten before public production deployment
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def on_startup():
-    init_db()
 
 
 @app.get("/")
@@ -45,7 +54,7 @@ def root():
 
 @app.get("/wards")
 def list_wards(db: Session = Depends(get_db)):
-    """Returns all monitored wards with their static info + vulnerability data."""
+    """Returns all monitored wards with static info + vulnerability data."""
     wards = db.query(WardDB).all()
     return [
         {
@@ -66,28 +75,42 @@ def list_wards(db: Session = Depends(get_db)):
 @app.get("/wards/risk")
 def get_live_risk(db: Session = Depends(get_db)):
     """
-    THE MAIN ENDPOINT for the dashboard.
-    Loads all districts from the CSV, fetches live weather for ALL of them
-    in a single batched API call, computes HTSI + vulnerability-adjusted
-    risk for each, stores a snapshot in the DB, and returns the full
-    result as JSON.
+    Loads districts, fetches live weather batch, computes risk scores,
+    persists a snapshot in the database, and caches the HTTP response for 5 minutes.
     """
+    # 1. Return cached response if under 5 minutes old
     if _cache["data"] and (time.time() - _cache["timestamp"] < 300):
         return _cache["data"]
 
     districts = load_districts_from_csv()
-    snapshots = fetch_all_current_batch(districts)
-    snapshot_by_id = {s.ward_id: s for s in snapshots}
 
+    # 2. Fetch external weather data with fallback for rate limits
+    try:
+        snapshots = fetch_all_current_batch(districts)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            # Fall back to stale cache if available
+            if _cache["data"]:
+                return _cache["data"]
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Open-Meteo weather service rate limit exceeded. Please try again in a few minutes.",
+            )
+        raise exc
+
+    snapshot_by_id = {s.ward_id: s for s in snapshots}
     results = []
+
     for ward in districts:
         snap = snapshot_by_id.get(ward.ward_id)
         if snap is None:
             continue
 
         weather_input = WeatherInput(
-            temp_c=snap.temp_c, rh_pct=snap.rh_pct,
-            wind_ms=snap.wind_ms, solar_wm2=snap.solar_wm2,
+            temp_c=snap.temp_c,
+            rh_pct=snap.rh_pct,
+            wind_ms=snap.wind_ms,
+            solar_wm2=snap.solar_wm2,
         )
         thermal = compute_thermal_index(weather_input)
 
@@ -109,10 +132,13 @@ def get_live_risk(db: Session = Depends(get_db)):
 
         record = RiskReadingDB(
             ward_id=ward.ward_id,
-            timestamp=datetime.utcnow(),
-            temp_c=snap.temp_c, rh_pct=snap.rh_pct,
-            wind_ms=snap.wind_ms, solar_wm2=snap.solar_wm2,
-            wbgt_c=thermal.wbgt_c, heat_index_c=thermal.heat_index_c,
+            timestamp=datetime.now(timezone.utc),
+            temp_c=snap.temp_c,
+            rh_pct=snap.rh_pct,
+            wind_ms=snap.wind_ms,
+            solar_wm2=snap.solar_wm2,
+            wbgt_c=thermal.wbgt_c,
+            heat_index_c=thermal.heat_index_c,
             utci_approx_c=thermal.utci_approx_c,
             vulnerability_index=vuln_score,
             final_risk_score=final_score,
@@ -139,7 +165,10 @@ def get_live_risk(db: Session = Depends(get_db)):
 
     db.commit()
 
-    result = {"generated_at": datetime.utcnow().isoformat(), "wards": results}
+    result = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "wards": results,
+    }
     _cache["data"] = result
     _cache["timestamp"] = time.time()
     return result
@@ -148,23 +177,30 @@ def get_live_risk(db: Session = Depends(get_db)):
 @app.get("/wards/{ward_id}/forecast")
 def get_ward_forecast(ward_id: str, days: int = 5):
     """
-    THE 3-5 DAY EARLY WARNING ENDPOINT.
-    Fetches hourly forecast weather for this ward N days ahead, runs EVERY
-    hour through the exact same HTSI engine used for live data, then
-    summarizes each day down to its single worst (highest-risk) hour.
-    This is what lets us say "Day 3 from now will hit Danger level at 2 PM."
+    Fetches hourly forecast weather for a ward and summarizes each day
+    by its worst (highest-risk) hour.
     """
     districts = load_districts_from_csv()
     ward = next((w for w in districts if w.ward_id == ward_id), None)
     if ward is None:
-        return {"error": f"Ward '{ward_id}' not found."}
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ward '{ward_id}' not found.",
+        )
 
     vuln_score = round(calculate_vulnerability_index(ward.ward_id) * 100, 1)
 
-    with httpx.Client() as client:
-        hourly_snapshots = fetch_forecast_weather(ward, client, days=days)
+    try:
+        with httpx.Client() as client:
+            hourly_snapshots = fetch_forecast_weather(ward, client, days=days)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Open-Meteo rate limit exceeded. Please wait a moment before trying again.",
+            )
+        raise exc
 
-    # Group hourly readings by calendar day, e.g. "2026-09-15"
     by_day = defaultdict(list)
     for snap in hourly_snapshots:
         day_key = snap.timestamp.split("T")[0]
@@ -177,14 +213,13 @@ def get_ward_forecast(ward_id: str, days: int = 5):
 
         for snap in snaps:
             weather_input = WeatherInput(
-                temp_c=snap.temp_c, rh_pct=snap.rh_pct,
-                wind_ms=snap.wind_ms, solar_wm2=snap.solar_wm2,
+                temp_c=snap.temp_c,
+                rh_pct=snap.rh_pct,
+                wind_ms=snap.wind_ms,
+                solar_wm2=snap.solar_wm2,
             )
             thermal = compute_thermal_index(weather_input)
             final_score = round(0.65 * thermal.risk_score_0_100 + 0.35 * vuln_score, 1)
-            mortality_multiplier = predict_mortality_risk_multiplier(
-                wbgt_c=thermal.wbgt_c, duration_days=1, vulnerability_score=vuln_score
-            )
 
             if final_score > worst_score:
                 worst_score = final_score
@@ -221,7 +256,7 @@ def get_ward_forecast(ward_id: str, days: int = 5):
 
 @app.get("/wards/{ward_id}/history")
 def get_ward_history(ward_id: str, db: Session = Depends(get_db)):
-    """Returns historical risk readings for a specific ward (for trend charts)."""
+    """Returns historical risk readings for a specific ward."""
     readings = (
         db.query(RiskReadingDB)
         .filter(RiskReadingDB.ward_id == ward_id)
