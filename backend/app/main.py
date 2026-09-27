@@ -18,6 +18,9 @@ import httpx
 from collections import defaultdict
 from app.services.vulnerability import calculate_vulnerability_index
 from app.core.thermal_index import compute_thermal_index, WeatherInput
+import time
+
+_cache = {"data": None, "timestamp": 0}
 
 app = FastAPI(title="ThermoGuard API", description="Human Thermal Stress Index & Heat-Risk Early Warning System")
 
@@ -69,6 +72,9 @@ def get_live_risk(db: Session = Depends(get_db)):
     risk for each, stores a snapshot in the DB, and returns the full
     result as JSON.
     """
+    if _cache["data"] and (time.time() - _cache["timestamp"] < 300):
+        return _cache["data"]
+
     districts = load_districts_from_csv()
     snapshots = fetch_all_current_batch(districts)
     snapshot_by_id = {s.ward_id: s for s in snapshots}
@@ -133,10 +139,10 @@ def get_live_risk(db: Session = Depends(get_db)):
 
     db.commit()
 
-    return {
-        "generated_at": datetime.utcnow().isoformat(),
-        "wards": results
-    }
+    result = {"generated_at": datetime.utcnow().isoformat(), "wards": results}
+    _cache["data"] = result
+    _cache["timestamp"] = time.time()
+    return result
 
 
 @app.get("/wards/{ward_id}/forecast")
@@ -177,8 +183,8 @@ def get_ward_forecast(ward_id: str, days: int = 5):
             thermal = compute_thermal_index(weather_input)
             final_score = round(0.65 * thermal.risk_score_0_100 + 0.35 * vuln_score, 1)
             mortality_multiplier = predict_mortality_risk_multiplier(
-    wbgt_c=thermal.wbgt_c, duration_days=1, vulnerability_score=vuln_score
-)
+                wbgt_c=thermal.wbgt_c, duration_days=1, vulnerability_score=vuln_score
+            )
 
             if final_score > worst_score:
                 worst_score = final_score
