@@ -10,19 +10,111 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from collections import defaultdict
 import time
+import logging
 import httpx
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
-from app.models.database import get_db, WardDB, RiskReadingDB, init_db
+from app.models.database import get_db, WardDB, RiskReadingDB, init_db, SessionLocal
 from app.services.ingestion import load_districts_from_csv, fetch_all_current_batch, fetch_forecast_weather
 from app.services.mortality_predictor import predict_mortality_risk_multiplier
 from app.services.vulnerability import calculate_vulnerability_index
 from app.core.thermal_index import compute_thermal_index, WeatherInput
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 _cache = {"data": None, "timestamp": 0}
+
+
+def update_weather_job():
+    """Fetches live weather snapshots, computes risk metrics, and populates cache."""
+    logger.info("Executing weather sync job...")
+    db = SessionLocal()
+    try:
+        districts = load_districts_from_csv()
+        snapshots = fetch_all_current_batch(districts)
+        snapshot_by_id = {s.ward_id: s for s in snapshots}
+
+        results = []
+        for ward in districts:
+            snap = snapshot_by_id.get(ward.ward_id)
+            if snap is None:
+                continue
+
+            weather_input = WeatherInput(
+                temp_c=snap.temp_c,
+                rh_pct=snap.rh_pct,
+                wind_ms=snap.wind_ms,
+                solar_wm2=snap.solar_wm2,
+            )
+            thermal = compute_thermal_index(weather_input)
+
+            vuln_score = round(calculate_vulnerability_index(ward.ward_id) * 100, 1)
+            final_score = round(0.65 * thermal.risk_score_0_100 + 0.35 * vuln_score, 1)
+
+            mortality_multiplier = predict_mortality_risk_multiplier(
+                wbgt_c=thermal.wbgt_c, duration_days=1, vulnerability_score=vuln_score
+            )
+
+            if final_score < 35:
+                alert_level = "Safe"
+            elif final_score < 55:
+                alert_level = "Caution"
+            elif final_score < 75:
+                alert_level = "Danger"
+            else:
+                alert_level = "Extreme Danger"
+
+            record = RiskReadingDB(
+                ward_id=ward.ward_id,
+                timestamp=datetime.now(timezone.utc),
+                temp_c=snap.temp_c,
+                rh_pct=snap.rh_pct,
+                wind_ms=snap.wind_ms,
+                solar_wm2=snap.solar_wm2,
+                wbgt_c=thermal.wbgt_c,
+                heat_index_c=thermal.heat_index_c,
+                utci_approx_c=thermal.utci_approx_c,
+                vulnerability_index=vuln_score,
+                final_risk_score=final_score,
+                alert_level=alert_level,
+            )
+            db.add(record)
+
+            results.append({
+                "ward_id": ward.ward_id,
+                "ward_name": ward.ward_name,
+                "city": ward.city,
+                "lat": ward.lat,
+                "lon": ward.lon,
+                "timestamp": snap.timestamp,
+                "temp_c": snap.temp_c,
+                "rh_pct": snap.rh_pct,
+                "wbgt_c": thermal.wbgt_c,
+                "heat_index_c": thermal.heat_index_c,
+                "vulnerability_index": vuln_score,
+                "final_risk_score": final_score,
+                "alert_level": alert_level,
+                "mortality_risk_multiplier": mortality_multiplier,
+            })
+
+        db.commit()
+
+        result = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "wards": results,
+        }
+        _cache["data"] = result
+        _cache["timestamp"] = time.time()
+        logger.info("Weather sync job successfully completed.")
+    except Exception as e:
+        logger.error(f"Error executing weather sync: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 
 @asynccontextmanager
@@ -73,105 +165,33 @@ def list_wards(db: Session = Depends(get_db)):
 
 
 @app.get("/wards/risk")
-def get_live_risk(db: Session = Depends(get_db)):
+def get_live_risk():
     """
-    Loads districts, fetches live weather batch, computes risk scores,
-    persists a snapshot in the database, and caches the HTTP response for 5 minutes.
+    Returns cached risk data. If cache is missing or stale (>5 min), attempts synchronous update.
+    Returns 200 OK continuously without throwing HTTP 429 errors.
     """
-    # 1. Return cached response if under 5 minutes old
+    # Return valid cache if under 5 minutes old
     if _cache["data"] and (time.time() - _cache["timestamp"] < 300):
         return _cache["data"]
 
-    districts = load_districts_from_csv()
-
-    # 2. Fetch external weather data with fallback for rate limits
+    # Fallback sync run if cache is missing or stale
     try:
-        snapshots = fetch_all_current_batch(districts)
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 429:
-            # Fall back to stale cache if available
-            if _cache["data"]:
-                return _cache["data"]
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Open-Meteo weather service rate limit exceeded. Please try again in a few minutes.",
-            )
-        raise exc
+        update_weather_job()
+        if _cache["data"]:
+            return _cache["data"]
+    except Exception as exc:
+        logger.error(f"Fallback weather sync failed: {exc}")
 
-    snapshot_by_id = {s.ward_id: s for s in snapshots}
-    results = []
+    # Safe fallback if rate-limited during initial startup
+    if _cache["data"]:
+        return _cache["data"]
 
-    for ward in districts:
-        snap = snapshot_by_id.get(ward.ward_id)
-        if snap is None:
-            continue
-
-        weather_input = WeatherInput(
-            temp_c=snap.temp_c,
-            rh_pct=snap.rh_pct,
-            wind_ms=snap.wind_ms,
-            solar_wm2=snap.solar_wm2,
-        )
-        thermal = compute_thermal_index(weather_input)
-
-        vuln_score = round(calculate_vulnerability_index(ward.ward_id) * 100, 1)
-        final_score = round(0.65 * thermal.risk_score_0_100 + 0.35 * vuln_score, 1)
-
-        mortality_multiplier = predict_mortality_risk_multiplier(
-            wbgt_c=thermal.wbgt_c, duration_days=1, vulnerability_score=vuln_score
-        )
-
-        if final_score < 35:
-            alert_level = "Safe"
-        elif final_score < 55:
-            alert_level = "Caution"
-        elif final_score < 75:
-            alert_level = "Danger"
-        else:
-            alert_level = "Extreme Danger"
-
-        record = RiskReadingDB(
-            ward_id=ward.ward_id,
-            timestamp=datetime.now(timezone.utc),
-            temp_c=snap.temp_c,
-            rh_pct=snap.rh_pct,
-            wind_ms=snap.wind_ms,
-            solar_wm2=snap.solar_wm2,
-            wbgt_c=thermal.wbgt_c,
-            heat_index_c=thermal.heat_index_c,
-            utci_approx_c=thermal.utci_approx_c,
-            vulnerability_index=vuln_score,
-            final_risk_score=final_score,
-            alert_level=alert_level,
-        )
-        db.add(record)
-
-        results.append({
-            "ward_id": ward.ward_id,
-            "ward_name": ward.ward_name,
-            "city": ward.city,
-            "lat": ward.lat,
-            "lon": ward.lon,
-            "timestamp": snap.timestamp,
-            "temp_c": snap.temp_c,
-            "rh_pct": snap.rh_pct,
-            "wbgt_c": thermal.wbgt_c,
-            "heat_index_c": thermal.heat_index_c,
-            "vulnerability_index": vuln_score,
-            "final_risk_score": final_score,
-            "alert_level": alert_level,
-            "mortality_risk_multiplier": mortality_multiplier,
-        })
-
-    db.commit()
-
-    result = {
+    return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "wards": results,
+        "status": "warning",
+        "message": "Data stream updating. Please refresh in 30 seconds.",
+        "wards": []
     }
-    _cache["data"] = result
-    _cache["timestamp"] = time.time()
-    return result
 
 
 @app.get("/wards/{ward_id}/forecast")
