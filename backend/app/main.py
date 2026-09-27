@@ -6,7 +6,7 @@ Exposes ward risk data as REST endpoints for the dashboard to consume.
 Run with:  uvicorn app.main:app --reload
 Then open: http://127.0.0.1:8000/docs  for interactive API docs.
 """
-from app.services.alerts import check_and_send_alerts
+#from app.services.alerts import check_and_send_alerts
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -133,12 +133,9 @@ def get_live_risk(db: Session = Depends(get_db)):
 
     db.commit()
 
-    alerts_sent = check_and_send_alerts(results)
-
     return {
         "generated_at": datetime.utcnow().isoformat(),
-        "wards": results,
-        "alerts_sent": alerts_sent
+        "wards": results
     }
 
 
